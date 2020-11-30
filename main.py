@@ -1,4 +1,5 @@
 # -*- coding:utf-8 -*-
+from PIL import Image, ImageDraw
 from model import Yolo_v1
 from absl import flags
 from random import random, shuffle
@@ -9,6 +10,9 @@ import matplotlib.pyplot as plt
 import os
 import sys
 import math
+
+OBJECT_NAMES = ["tvmonitor", "train", "sofa", "sheep", "cat", "chair", "bottle", "motorbike", "boat", "bird",
+                   "person", "aeroplane", "dog", "pottedplant", "cow", "bus", "diningtable", "horse", "bicycle", "car"]
 
 flags.DEFINE_string("tr_img_path", "D:/[1]DB/[3]detection_DB/PascalVoc2012/pascal_voc_2012/VOC2012/JPEGImages", "Training image path")
 
@@ -35,13 +39,13 @@ def func_(image, label):
 
     image = tf.io.read_file(image)
     image = tf.image.decode_jpeg(image, 3)
-    original_height, original_width = image.shape[0], image.shape[1]
+    shape = tf.shape(image)
     image = tf.image.resize(image, [FLAGS.img_size, FLAGS.img_size])
 
     image = tf.image.convert_image_dtype(image, tf.float32) / 255.
     #image = tf.image.per_image_standardization(image)
 
-    return image, label, original_height, original_width
+    return image, label, shape
 
 def read_label(file, batch_size):
     # https://github.com/lovish1234/YOLOv1/blob/master/preprocess.py
@@ -124,6 +128,44 @@ def cal_iou(predict_box1, predict_box2, label_box):
     iou2 = tf.reshape(get_iou(label_box, predict_box2), [-1, 7, 7, 1])
     return tf.concat([iou1, iou2], 3)
 
+def select_bbox_again(indx_class, scores_class, pred_bboxes):
+    #indx_class: the index after non-maximun suppression, [20, 5]
+    #scores_class: confidence * class_confidence, [20, 98]
+    #pred_bboxes: [98, 4]
+    mask = np.zeros_like(scores_class)
+    for i in range(20):
+        for j in range(5):
+            mask[i, indx_class[i, j]] = 1
+    scores_class[scores_class < 0.2] = 0
+    scores_class *= mask
+    max_score = np.max(scores_class, axis=0)
+    indx_bboxes = np.arange(0, 98)
+    indx_bboxes = indx_bboxes[max_score > 0]
+    class_indx = np.argmax(scores_class, axis=0)
+    bbox_indx = class_indx[max_score > 0]
+    return pred_bboxes[indx_bboxes], bbox_indx
+
+def draw_bbox(img, bbox, text):
+    h, w = img.shape[0], img.shape[1]
+    x0, y0, x1, y1 = max(bbox[0], 0), max(bbox[1], 0), min(bbox[2], w-1), min(bbox[3], h-1)
+    drawed_img = img * 1
+    color = np.zeros([x1 - x0 + 1, 3])
+    color[:, 1] = np.ones([x1 - x0 + 1]) * 255#Green rectangle
+    drawed_img[y0, x0:x1 + 1, :] = color
+    drawed_img[y1, x0:x1 + 1, :] = color
+    color = np.zeros([y1 - y0 + 1, 3])
+    color[:, 1] = np.ones([y1 - y0 + 1]) * 255  # Green rectangle
+    drawed_img[y0:y1 + 1, x0, :] = color
+    drawed_img[y0:y1 + 1, x1, :] = color
+    #type text
+    drawed_img = Image.fromarray(np.uint8(drawed_img))
+    draw = ImageDraw.Draw(drawed_img)
+    x = int(bbox[0])
+    y = int(bbox[1])
+    draw.text((x, y), text)
+    drawed_img = np.array(drawed_img)
+    return drawed_img
+
 def save_fig(model, images, original_height, original_width):
 
     output = model(images, False)
@@ -147,21 +189,47 @@ def save_fig(model, images, original_height, original_width):
     offset_X = np.transpose(offset_Y, (1, 0, 2))
 
     for i in range(FLAGS.batch_size):
+        original_height_ = original_height[i].numpy()
+        original_width_ = original_width[i].numpy()
+        predictedObjectConfidence_ = predictedObjectConfidence[i]
         np_result_ = np_result[i]
 
-        np_result_[:, :, :, 0] = 1. * (np_result_[:, :, :, 0]+offset_X) * original_width
-        np_result_[:, :, :, 1] = 1. * (np_result_[:, :, :, 1]+offset_Y) * original_height
+        np_result_[:, :, :, 0] = 1. * (np_result_[:, :, :, 0]+offset_X) * original_width[i].numpy()
+        np_result_[:, :, :, 1] = 1. * (np_result_[:, :, :, 1]+offset_Y) * original_height[i].numpy()
 
-        np_result_[:, :, :, 2] = original_width * np.multiply(np_result_[:, :, :, 2],
+        np_result_[:, :, :, 2] = original_width[i].numpy() * np.multiply(np_result_[:, :, :, 2],
                                                               np_result_[:, :, :, 2])
-        np_result_[:, :, :, 3] = original_width * np.multiply(np_result_[:, :, :, 3],
+        np_result_[:, :, :, 3] = original_width[i].numpy() * np.multiply(np_result_[:, :, :, 3],
                                                               np_result_[:, :, :, 3])
 
-        for class_confi in class_confidences:
-            scores = predictedObjectConfidence * class_confi
-            scores = tf.reshape(scores, [-1])
+        x1 = np_result_[:, :, :, 0] - np_result_[:, :, :, 2]/2
+        y1 = np_result_[:, :, :, 1] - np_result_[:, :, :, 3]/2
+        x2 = np_result_[:, :, :, 2] + np_result_[:, :, :, 2]/2
+        y2 = np_result_[:, :, :, 3] + np_result_[:, :, :, 3]/2
+        coord = tf.concat([x1, y1, x2, y2], axis=-1)
+        coord = tf.reshape(coord, [-1, 4])
+        #np_result_ = np_result_[np.newaxis, :, :, :, :]
 
-        # [7,7,2,20]
+        indx_class = []
+        scores_class = []
+        for class_confi in class_confidences:
+            scores = predictedObjectConfidence_ * class_confi[i]
+            scores = tf.reshape(scores, [-1])
+            idx = tf.image.non_max_suppression(coord, scores, 5)
+            indx_class.append(idx[tf.newaxis, :])
+            scores_class.append(scores[tf.newaxis, :])
+        indx_class = tf.concat(indx_class, axis=0)
+        scores_class = tf.concat(scores_class, axis=0)
+
+        bboxes, class_num = select_bbox_again(indx_class.numpy(), scores_class.numpy(), coord.numpy())
+        for j in range(bboxes.shape[0]):
+            try:
+                image = tf.image.resize(images[j], [original_height_, original_width_])
+                img = draw_bbox(image.numpy() * 255, np.int32(bboxes[j]), OBJECT_NAMES[class_num[j]])
+                #Image.fromarray(np.uint8(img)).show()
+            except:
+                continue
+        Image.fromarray(np.uint8(img)).show()
 
     return img
 
@@ -250,12 +318,13 @@ def main():
     batch_idx = len(text_list) // FLAGS.batch_size
     it = iter(data)
     for step in range(batch_idx):
-        image, label, original_height, original_width = next(it)   
+        image, label, shape = next(it)
+        original_height, original_width = shape[:, 0], shape[:, 1]
         label = read_label(label, FLAGS.batch_size)
 
-        loss = cal_loss(model, image, label)
+        loss = cal_loss(model, image, label)    # 이 부분은 쉽게 이해함
 
-        save_fig(model, image, original_height, original_width)
+        save_fig(model, image, original_height, original_width) # 이 부분이 코드가 너무 복잡함
 
         print(loss)
 
