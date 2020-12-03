@@ -152,118 +152,82 @@ def test_iou(box1, box2):
 
 def save_fig(model, images, original_height, original_width):
 
-    output = model(images, False)
+    logits = model(images, False)
 
-    pred_class = tf.reshape(output[:, 0:980], [-1,7,7,20])
-    pred_confidence = tf.reshape(output[:, 980:1078], [-1, 7, 7, 2])
+    pred_class = logits[:,:,:,:20]
+    pred_confidence = logits[:, :, :, 20:22]
 
-    predictedBoxes = tf.reshape(output[:, 1078:], [-1, 7, 7, 2, 4])
+    predictedBoxes = tf.reshape(logits[:, :, :, 22:], [-1, 7, 7, 2, 4])
     np_result = predictedBoxes.numpy()
     np_result = np.array(np_result)
 
-    offset_Y = np.tile(np.arange(7, dtype=np.float32)[:, np.newaxis, np.newaxis],(1, 7, 2))
-    offset_X = np.transpose(offset_Y, (1, 0, 2))
+    offset = np.transpose(np.reshape(np.array([np.arange(7)]*14),(2,7,7)),(1,2,0))
+    probs = np.zeros((7,7,2,20))
 
     for i in range(FLAGS.batch_size):
 
         original_height_ = original_height[i].numpy()
         original_width_ = original_width[i].numpy()
-
+        img = images[i].numpy()
         np_result_ = np_result[i]
 
-        np_result_[:, :, :, 0] = 1. * (np_result_[:, :, :, 0]+offset_X) * FLAGS.img_size / FLAGS.output_size
-        np_result_[:, :, :, 1] = 1. * (np_result_[:, :, :, 1]+offset_Y) * FLAGS.img_size / FLAGS.output_size
+        np_result_[:, :, :, 0] = 1. * (np_result_[:, :, :, 0]+offset) * FLAGS.img_size / FLAGS.output_size
+        np_result_[:, :, :, 1] = 1. * (np_result_[:, :, :, 1]+np.transpose(offset, (1,0,2))) * FLAGS.img_size / FLAGS.output_size
 
-        np_result_[:, :, :, 2] = FLAGS.img_size * np.multiply(np_result_[:, :, :, 2],
+        np_result_[:, :, :, 2] = original_width_ * np.multiply(np_result_[:, :, :, 2],
                                                               np_result_[:, :, :, 2])
-        np_result_[:, :, :, 3] = FLAGS.img_size * np.multiply(np_result_[:, :, :, 3],
+        np_result_[:, :, :, 3] = original_height_ * np.multiply(np_result_[:, :, :, 3],
                                                               np_result_[:, :, :, 3])
-
-        np_result_[:, :, :, 0] = np_result_[:, :, :, 0] - np_result_[:, :, :, 2] / 2
-        np_result_[:, :, :, 1] = np_result_[:, :, :, 1] - np_result_[:, :, :, 3] / 2
-        np_result_[:, :, :, 2] = np_result_[:, :, :, 0] + np_result_[:, :, :, 2] / 2
-        np_result_[:, :, :, 3] = np_result_[:, :, :, 1] + np_result_[:, :, :, 3] / 2
-
-        np_result_[:, :, :, 0] = np_result_[:, :, :, 1]
-        np_result_[:, :, :, 1] = np_result_[:, :, :, 0]
-        np_result_[:, :, :, 2] = np_result_[:, :, :, 3]
-        np_result_[:, :, :, 3] = np_result_[:, :, :, 2]
         box_data = np_result_
-
-
-
-
-
-
-
-
-
-
-
-
-
+        # 박스 클립핑을 꼭 할 것!
         # 1. 각 바운딩 박스와 그 바운딩 박스의 중심좌료가 있는 그리데셀의 스코어 값들을 각각 곱함
-        pred_confidence_ = pred_confidence[i]
-        pred_confidence_ = tf.expand_dims(pred_confidence_, 0)  # [1, 7, 7, 2]
-        pred_class_ = pred_class[i]
-        pred_class_ = tf.expand_dims(pred_class_, 0)    # [1, 7, 7, 20]
-        pred_class_ = tf.split(pred_class_, num_or_size_splits=20, axis=-1)
+        for k in range(2):
+            for m in range(20):
+                probs[:,:,k,m] = np.multiply(pred_class[i,:,:,m],pred_confidence[i,:,:,k])
 
-        each_class_score_buf = []
-        for pred_cla in pred_class_:
-            each_class_score = pred_confidence_ * pred_cla  # [1, 7, 7, 2]
-            each_class_score = each_class_score.numpy() # [1, 7, 7, 2]
+        filter_mat_probs = np.array(probs>=FLAGS.mini_threshold,dtype='bool')
+        filter_mat_boxes = np.nonzero(filter_mat_probs)
+        boxes_filtered = box_data[filter_mat_boxes[0],filter_mat_boxes[1],filter_mat_boxes[2]]
+        probs_filtered = probs[filter_mat_probs]
+        classes_num_filtered = np.argmax(filter_mat_probs,axis=3)[filter_mat_boxes[0],filter_mat_boxes[1],filter_mat_boxes[2]]
 
-            # 2. threshold 값으로 0.2를 지정, 해당 0.2 값보다 작은 결과는 다 0으로 만듬
-            for k in range(FLAGS.output_size):
-                for m in range(FLAGS.output_size):
-                    for b in range(2):
-                        if each_class_score[0, k, m, b] < FLAGS.mini_threshold:
-                            each_class_score[0, k, m, b] = 0.
-                        else:
-                            each_class_score[0, k, m, b] = each_class_score[0, k, m, b]
+        argsort = np.array(np.argsort(probs_filtered))[::-1]
+        boxes_filtered = boxes_filtered[argsort]
+        probs_filtered = probs_filtered[argsort]
+        classes_num_filtered = classes_num_filtered[argsort]
+    
+        for i in range(len(boxes_filtered)):
+            if probs_filtered[i] == 0 : continue
+            for j in range(i+1,len(boxes_filtered)):
+                if test_iou(boxes_filtered[i],boxes_filtered[j]) > 0.5:
+                    probs_filtered[j] = 0.0
 
-            each_class_score_buf.append(each_class_score)
-        each_class_score_buf = tf.convert_to_tensor(each_class_score_buf)   # [20, 1, 7, 7, 2]
-        each_class_score_buf = tf.transpose(each_class_score_buf, [1,2,3,4,0])  # [1, 7, 7, 2, 20]
+        filter_iou = np.array(probs_filtered>0.0,dtype='bool')
+        boxes_filtered = boxes_filtered[filter_iou]
+        probs_filtered = probs_filtered[filter_iou]
+        classes_num_filtered = classes_num_filtered[filter_iou]
 
-        each_class_score_NPlist = each_class_score_buf.numpy()
+        result = []
+        for i in range(len(boxes_filtered)):    # 고쳐ㅛ야되ㅏㅁ
+            result.append([OBJECT_NAMES[classes_num_filtered[i]],boxes_filtered[i][0],boxes_filtered[i][1],boxes_filtered[i][2],boxes_filtered[i][3],probs_filtered[i]])
 
-        # 3. 각 박스에 있는값들 내림차순으로 정렬
-        boxidx_class = []
-        idx_class = []
-        val_class = []
-        for c in range(20):
-            sort_append = []
-            box = []
-            for k in range(FLAGS.output_size):
-                for m in range(FLAGS.output_size):
-                    for b in range(2):
-                        sort_append.append(each_class_score_buf[0, k, m, b, c].numpy())
-                        box.append(box_data[k, m, b, :])
+        for i in range(len(result)):
+            x = int(result[i][1])
+            y = int(result[i][2])
+            w = int(result[i][3]) // 2
+            h = int(result[i][4]) // 2
 
-            sort_val = np.sort(sort_append)[::-1]   # 내림차순 정렬 (value)   [98]
-            sort_idx = np.argsort(sort_append)[::-1]    # 내림차순 정렬 (index) [98]
-            sort_box = []
-            for ii in range(len(sort_append)):
-                sort_box.append(box[sort_idx[ii]])
-            sort_box = np.array(sort_box)   # 내림차순 정렬 (box) [98, 4]
+            xmin = max(x - w, 0)
+            ymin = max(y - h, 0)
+            xmax = max(x + w, 0)
+            ymax = max(y + h, 0)
 
-            # NMS
-            selected_indices = tf.image.non_max_suppression(sort_box, sort_val, 3)
-            selected_boxes = tf.gather(sort_box, selected_indices)
+            cv2.rectangle(img,(xmin,ymin),(xmax,ymax),(0,255,0),2)
+            cv2.putText(img,result[i][0] + ' : %.2f' % result[i][5],(xmin+5,ymin-7),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,0),1)
 
-            boxidx_class.append(selected_boxes[tf.newaxis, :])
-            val_class.append(sort_val[tf.newaxis, :])
-            idx_class.append(sort_idx[tf.newaxis, :])
-
-        boxidx_class = tf.concat(boxidx_class, 0)   # [3]
-        val_class = tf.concat(val_class, 0)     # []
-        idx_class = tf.concat(idx_class, 0)
-
-
-
-            # 박스 위치도 같이 움직여야 하는것 아닌가?
+        # https://github.com/gliese581gg/YOLO_tensorflow/blob/master/YOLO_small_tf.py  --> 219 줄!!!
+        cv2.imshow("dd", img)
+        cv2.waitKey(0)
 
 
 
@@ -275,9 +239,9 @@ def cal_loss(model, images, labels):
 
     with tf.GradientTape(persistent=True) as tape:
         logits = model(images, training=True)
-        pred_class = tf.reshape(logits[:, 0:980], [-1,7,7,20])
-        predictedObjectConfidence = tf.reshape(logits[:, 980:1078], [-1, 7, 7, 2])
-        predictedBoxes = tf.reshape(logits[:, 1078:], [-1, 7, 7, 2, 4])
+        pred_class = logits[:,:,:,:20]
+        predictedObjectConfidence = logits[:, :, :, 20:22]
+        predictedBoxes = tf.reshape(logits[:, :, :, 22:], [-1, 7, 7, 2, 4])
         predictedFirstBoxes = predictedBoxes[:, :, :, 0:1, :]
         predictedFirstBoxes = tf.squeeze(predictedFirstBoxes, 3)
         predictedSecondBoxes = predictedBoxes[:, :, :, 1:2, :]
