@@ -53,7 +53,6 @@ def func_(image, label):
     return image, label, shape, list_
 
 def read_label(file, batch_size):
-    # https://github.com/lovish1234/YOLOv1/blob/master/preprocess.py
 
     cell_h = FLAGS.img_size // FLAGS.output_size
     cell_w = FLAGS.img_size // FLAGS.output_size
@@ -67,10 +66,6 @@ def read_label(file, batch_size):
             line = f.readline()
             if not line: break
             line = line.split('\n')[0]
-            
-            # resize 448 x 448 with roi
-            #height_rate = (FLAGS.img_size / int(line.split(',')[4]))
-            #width_rate = (FLAGS.img_size / int(line.split(',')[5]))
 
             xmin = int(int(line.split(',')[0]))
             xmax = int(int(line.split(',')[2]))
@@ -80,205 +75,120 @@ def read_label(file, batch_size):
             width = int(line.split(',')[5])
             classes = int(line.split(',')[6])
 
-            # take the center point and scale according to new size
+            # xmin, xmax에 대해서는 이게 순서가 뒤죽박죽인것도 있는거같아서
+            # https://github.com/ivder/LabelMeYoloConverter/blob/master/convert.py 참고
 
-            C_x = ((xmin + xmax) * 1.0 / 2.0) * \
-                    (FLAGS.img_size * 1.0 / width)
-            C_y = ((ymin + ymax) * 1.0 / 2.0) * \
-                    (FLAGS.img_size * 1.0 / height)
-            b_w = (xmax - xmin) * 1.0
-            b_h = (ymax - ymin) * 1.0
 
-            offset_x = ((C_x % cell_w) * 1.0) / cell_w
-            offset_y = ((C_y % cell_h) * 1.0) / cell_h
+            x = (xmin + xmax) / 2.0
+            y = (ymin + ymax) / 2.0
+            w = xmax - xmin
+            h = ymax - ymin
 
-            offset_w = math.sqrt(b_w * 1.0) / width
-            offset_h = math.sqrt(b_h * 1.0) / height
+            x = x * (1/width)
+            w = w * (1/width)
+            y = y * (1/height)
+            h = h * (1/height)
 
-            boxData = [offset_x, offset_y, offset_w, offset_h]
+            i, j = int(FLAGS.output_size * y), int(FLAGS.output_size * x)
+            x_cell, y_cell = FLAGS.output_size * x - j, FLAGS.output_size * y - i
+            width_cell = w * FLAGS.output_size
+            height_cell = h * FLAGS.output_size
 
-            responsibleGridX = int(C_x / cell_w)    # confidence coordinate
-            responsibleGridY = int(C_y / cell_h)
+            boxData = [x_cell, y_cell, width_cell, height_cell]
 
-            responsibleGrid[b][responsibleGridX][responsibleGridY][5:classes + 6] = 1    # class
-            responsibleGrid[b][responsibleGridX][responsibleGridY][0:4] = boxData    # box
-            responsibleGrid[b][responsibleGridX][responsibleGridY][4] = 1 # confidence
+            responsibleGridX = i
+            responsibleGridY = j
 
-        #    cla.append(responsibleGrid)
 
-        #label.append(cla)
+            # 이부분 순서를 고쳐야한다! 우선은 이 인덱스 순서는 loss를 작성하고 진행하자
+            responsibleGrid[b][responsibleGridX][responsibleGridY][classes] = 1    # class
+            responsibleGrid[b][responsibleGridX][responsibleGridY][21:25] = boxData    # box
+            responsibleGrid[b][responsibleGridX][responsibleGridY][20] = 1 # confidence
+
 
     responsibleGrid = np.array(responsibleGrid, dtype=np.float32)
 
     return responsibleGrid
 
-def cal_iou(predict_box1, predict_box2, label_box):
-    def get_iou(label_box, predict_box):
+def train_IOU(predict_box, label_box):
 
-        intersection_width = tf.minimum(predict_box[:, :, :, 0] + 0.5*predict_box[:, :, :, 2],
-                                        label_box[:, :, :, 0] + 0.5*label_box[:, :, :, 2]) \
-                            - tf.maximum(predict_box[:, :, :, 0] - 0.5*predict_box[:, :, :, 2],
-                                            label_box[:, :, :, 0] - 0.5*label_box[:, :, :, 2])
+    box1_x1 = predict_box[..., 0:1] - predict_box[..., 2:3] / 2
+    box1_y1 = predict_box[..., 1:2] - predict_box[..., 3:4] / 2
+    box1_x2 = predict_box[..., 0:1] + predict_box[..., 2:3] / 2
+    box1_y2 = predict_box[..., 1:2] + predict_box[..., 3:4] / 2
 
-        intersection_height = tf.minimum(predict_box[:, :, :, 1] + 0.5*predict_box[:, :, :, 3],
-                                        label_box[:, :, :, 1] + 0.5*label_box[:, :, :, 3]) \
-                            - tf.maximum(predict_box[:, :, :, 1] - 0.5*predict_box[:, :, :, 3],
-                                            label_box[:, :, :, 1] - 0.5*label_box[:, :, :, 3])
+    box2_x1 = label_box[..., 0:1] - label_box[..., 2:3] / 2
+    box2_y1 = label_box[..., 1:2] - label_box[..., 3:4] / 2
+    box2_x2 = label_box[..., 0:1] + label_box[..., 2:3] / 2
+    box2_y2 = label_box[..., 1:2] + label_box[..., 3:4] / 2
 
-        intersection = tf.multiply(tf.maximum(0, intersection_height), tf.maximum(0, intersection_width))
+    intersect_x1 = tf.maximum(box1_x1, box2_x1)
+    intersect_y1 = tf.maximum(box1_y1, box2_y1)
+    intersect_x2 = tf.minimum(box1_x2, box2_x2)
+    intersect_y2 = tf.minimum(box1_y2, box2_y2)
 
-        union = tf.subtract(tf.multiply(predict_box[:, :, :, 2], predict_box[:, :, :, 3]) + tf.multiply(label_box[:, :, :, 2], label_box[:, :, :, 3]),intersection)
+    intersect = tf.clip_by_value(intersect_x2 - intersect_x1, clip_value_min=0, clip_value_max=7) * \
+                tf.clip_by_value(intersect_y2 - intersect_y1, clip_value_min=0, clip_value_max=7)
 
-        iou = tf.divide(intersection, union)
+    box1_area = tf.abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
+    box2_area = tf.abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
 
-        return iou
+    iou = intersect / (box1_area + box2_area - intersect + 1e-7)
 
-    iou1 = tf.reshape(get_iou(label_box, predict_box1), [-1, 7, 7, 1])
-    iou2 = tf.reshape(get_iou(label_box, predict_box2), [-1, 7, 7, 1])
-    return tf.concat([iou1, iou2], 3)
-
-def test_iou(box1, box2):
-
-    intersection_width = max(0, min(box1[0] + box1[2]*0.5, box2[0] + box2[2]*0.5) \
-                        - max(box1[0] - box1[2]*0.5, box2[0] - box2[2]*0.5))
-
-    intersection_height = max(0, min(box1[1] + box1[3]*0.5, box2[1] + box2[3]*0.5) \
-                        - max(box1[1] - box1[3]*0.5, box2[1] - box2[3]*0.5))
-
-    intersection = intersection_width * intersection_height
-    union = box1[2]*box1[3] + box2[2]*box2[3] - intersection
-
-    return intersection / union
+    return iou
 
 def save_fig(model, images, original_height, original_width):
-
-    logits = model(images, False)
-
-    pred_class = logits[:,:,:,:20]
-    pred_confidence = logits[:, :, :, 20:22]
-
-    predictedBoxes = tf.reshape(logits[:, :, :, 22:], [-1, 7, 7, 2, 4])
-    np_result = predictedBoxes.numpy()
-    np_result = np.array(np_result)
-
-    offset = np.transpose(np.reshape(np.array([np.arange(7)]*14),(2,7,7)),(1,2,0))
-    probs = np.zeros((7,7,2,20))
-
-    for i in range(FLAGS.batch_size):
-
-        original_height_ = original_height[i].numpy()
-        original_width_ = original_width[i].numpy()
-        img = images[i].numpy()
-        np_result_ = np_result[i]
-
-        np_result_[:, :, :, 0] = 1. * (np_result_[:, :, :, 0]+offset) * FLAGS.img_size / FLAGS.output_size
-        np_result_[:, :, :, 1] = 1. * (np_result_[:, :, :, 1]+np.transpose(offset, (1,0,2))) * FLAGS.img_size / FLAGS.output_size
-
-        np_result_[:, :, :, 2] = original_width_ * np.multiply(np_result_[:, :, :, 2],
-                                                              np_result_[:, :, :, 2])
-        np_result_[:, :, :, 3] = original_height_ * np.multiply(np_result_[:, :, :, 3],
-                                                              np_result_[:, :, :, 3])
-        box_data = np_result_
-        # 박스 클립핑을 꼭 할 것!
-        # 1. 각 바운딩 박스와 그 바운딩 박스의 중심좌료가 있는 그리데셀의 스코어 값들을 각각 곱함
-        for k in range(2):
-            for m in range(20):
-                probs[:,:,k,m] = np.multiply(pred_class[i,:,:,m],pred_confidence[i,:,:,k])
-
-        filter_mat_probs = np.array(probs>=FLAGS.mini_threshold,dtype='bool')
-        filter_mat_boxes = np.nonzero(filter_mat_probs)
-        boxes_filtered = box_data[filter_mat_boxes[0],filter_mat_boxes[1],filter_mat_boxes[2]]
-        probs_filtered = probs[filter_mat_probs]
-        classes_num_filtered = np.argmax(filter_mat_probs,axis=3)[filter_mat_boxes[0],filter_mat_boxes[1],filter_mat_boxes[2]]
-
-        argsort = np.array(np.argsort(probs_filtered))[::-1]
-        boxes_filtered = boxes_filtered[argsort]
-        probs_filtered = probs_filtered[argsort]
-        classes_num_filtered = classes_num_filtered[argsort]
-    
-        for i in range(len(boxes_filtered)):
-            if probs_filtered[i] == 0 : continue
-            for j in range(i+1,len(boxes_filtered)):
-                if test_iou(boxes_filtered[i],boxes_filtered[j]) > 0.5:
-                    probs_filtered[j] = 0.0
-
-        filter_iou = np.array(probs_filtered>0.0,dtype='bool')
-        boxes_filtered = boxes_filtered[filter_iou]
-        probs_filtered = probs_filtered[filter_iou]
-        classes_num_filtered = classes_num_filtered[filter_iou]
-
-        result = []
-        for i in range(len(boxes_filtered)):    # 고쳐ㅛ야되ㅏㅁ
-            result.append([OBJECT_NAMES[classes_num_filtered[i]],boxes_filtered[i][0],boxes_filtered[i][1],boxes_filtered[i][2],boxes_filtered[i][3],probs_filtered[i]])
-
-        for i in range(len(result)):
-            x = int(result[i][1])
-            y = int(result[i][2])
-            w = int(result[i][3]) // 2
-            h = int(result[i][4]) // 2
-
-            xmin = max(x - w, 0)
-            ymin = max(y - h, 0)
-            xmax = max(x + w, 0)
-            ymax = max(y + h, 0)
-
-            cv2.rectangle(img,(xmin,ymin),(xmax,ymax),(0,255,0),2)
-            cv2.putText(img,result[i][0] + ' : %.2f' % result[i][5],(xmin+5,ymin-7),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,0),1)
-
-        # https://github.com/gliese581gg/YOLO_tensorflow/blob/master/YOLO_small_tf.py  --> 219 줄!!!
-        cv2.imshow("dd", img)
-        cv2.waitKey(0)
-
-
-
 
     return image
 
 def cal_loss(model, images, labels):
-    # https://github.com/lovish1234/YOLOv1/blob/master/yolo.py
 
-    with tf.GradientTape(persistent=True) as tape:
-        logits = model(images, training=True)
-        pred_class = logits[:,:,:,:20]
-        predictedObjectConfidence = logits[:, :, :, 20:22]
-        predictedBoxes = tf.reshape(logits[:, :, :, 22:], [-1, 7, 7, 2, 4])
-        predictedFirstBoxes = predictedBoxes[:, :, :, 0:1, :]
-        predictedFirstBoxes = tf.squeeze(predictedFirstBoxes, 3)
-        predictedSecondBoxes = predictedBoxes[:, :, :, 1:2, :]
-        predictedSecondBoxes = tf.squeeze(predictedSecondBoxes, 3)
+    # 모델의 최종 output은 1460 이 된다.
+    # https://www.youtube.com/watch?v=n9_XyCGr-MI
+    with tf.GradientTape() as tape:
+        predict = model(images, True)   # [:, 1470]
+        predict = tf.reshape(predict, [-1, FLAGS.output_size, FLAGS.output_size, 20 + 2*5]) # [:, 7, 7, 30]
 
-        groundTruthClasses = labels[:, :, :, 5:]
-        groundTruthBoxes = labels[:, :, :, 0:4]
-        groundTruthGrid = labels[:, :, :, 4:5]
+        output_b1 = train_IOU(predict[..., 21:25], labels[..., 21:25])    # [:, 7, 7, 1]
+        output_b2 = train_IOU(predict[..., 26:30], labels[..., 21:25])    # [:, 7, 7, 1]
+        ious = tf.concat([output_b1, output_b2], 3) # [:, 7, 7, 2]
+        # torch 에서는 max를 따로 구했는데 왜 ???굳히??
+        best_box = tf.expand_dims(tf.argmax(ious, axis=3), 3)    # [:, 7, 7, 1]
+        best_box = tf.cast(best_box, tf.float32)
+        iou_max = tf.expand_dims(np.max(ious.numpy(), 3), 3)    # [:, 7, 7, 1]
+        exists_box = tf.expand_dims(labels[..., 20], 3) # [:, 7, 7, 1]
 
-        firstBox_loss = tf.reduce_sum(tf.square(predictedFirstBoxes - groundTruthBoxes), 3)
-        secondBox_loss = tf.reduce_sum(tf.square(predictedSecondBoxes - groundTruthBoxes), 3)
-                
-        IOU = cal_iou(predictedFirstBoxes, predictedSecondBoxes, groundTruthBoxes)
-        responsibleBox = tf.greater(IOU[:, :, :, 0], IOU[:, :, :, 1])
-        coordinateLoss = tf.where(responsibleBox, firstBox_loss, secondBox_loss)    # [-1, 7, 7]
-        coordinateLoss = tf.reshape(coordinateLoss, [-1, 7, 7, 1])  # [-1, 7, 7, 1]
+        # =================== #
+        # Box coordinate loss #
+        box_prediction = exists_box * (
+            best_box * predict[..., 26:30] + (1 - best_box) * predict[..., 21:25]
+            )
 
-        coordinateLoss = FLAGS.coord_lambda * tf.multiply(groundTruthGrid, coordinateLoss)
+        box_target = exists_box * labels[..., 21:25]
 
-        object_loss = tf.square(predictedObjectConfidence - groundTruthGrid)
-        object_loss = tf.where(responsibleBox, object_loss[:, :, :, 0], object_loss[:, :, :, 1])
-        tempObjectLoss = tf.reshape(object_loss, [-1, 7, 7, 1])
+        box_prediction = box_prediction.numpy()
+        box_prediction[..., 2:4] = tf.math.sign(box_prediction[..., 2:4] * tf.sqrt(tf.abs(box_prediction[..., 2:4] + 1e-7)))    # sign 은 음수가 나오면 -1, 양수가나오면 1, 0이 나오면 0을 리턴한다
+        
+        box_target = box_target.numpy()
+        box_target[..., 2:4] = tf.sqrt(box_target[..., 2:4])
 
-        noObject_loss = FLAGS.noObject_lambda * tf.multiply(1 - groundTruthGrid, tempObjectLoss)
-        object_loss = tf.multiply(groundTruthGrid, tempObjectLoss)
+        box_loss = tf.keras.losses.MeanSquaredError()(tf.reshape(box_target, [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 4]),
+                                       tf.reshape(box_prediction, [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 4]))
+        # =================== #
 
-        class_loss = tf.square(pred_class - groundTruthClasses)
-        class_loss = tf.reduce_sum(tf.multiply(class_loss, groundTruthGrid), 3)
-        class_loss = tf.reshape(class_loss, [-1, 7, 7, 1])
+        # =================== #
+        # Object loss #
+        pred_box = (best_box * predict[..., 25:26] + (1 - best_box) * predict[..., 20:21])
 
-        total_loss = coordinateLoss + object_loss + noObject_loss + class_loss
-        total_loss = tf.reduce_mean(tf.reduce_sum(total_loss, [1,2,3]), 0)
+        object_loss = tf.keras.losses.MeanSquaredError()(tf.reshape(exists_box * labels[..., 20:21], [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 1]),
+                                          tf.reshape(exists_box * pred_box, [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 1]))
+        # =================== #
 
-        # coordinateLoss need reshape??
+        # =================== #
+        # No Object loss #
+        # --> 동영상 52:03 초 부터 다시보면서 하면된다. 이해는 다 된다.
+        # =================== #
 
-    grads = tape.gradient(total_loss, model.trainable_variables)
-    optim.apply_gradients(zip(grads, model.trainable_variables))
     return total_loss
 
 def main():
