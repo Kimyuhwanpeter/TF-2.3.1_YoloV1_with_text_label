@@ -39,6 +39,7 @@ FLAGS(sys.argv)
 
 optim = tf.compat.v1.train.MomentumOptimizer(FLAGS.lr, momentum=0.9)
 
+#############################################################################################
 def func_(image, label):
 
     list_ = image
@@ -78,7 +79,6 @@ def read_label(file, batch_size):
             # xmin, xmax에 대해서는 이게 순서가 뒤죽박죽인것도 있는거같아서
             # https://github.com/ivder/LabelMeYoloConverter/blob/master/convert.py 참고
 
-
             x = (xmin + xmax) / 2.0
             y = (ymin + ymax) / 2.0
             w = xmax - xmin
@@ -109,7 +109,9 @@ def read_label(file, batch_size):
     responsibleGrid = np.array(responsibleGrid, dtype=np.float32)
 
     return responsibleGrid
+#############################################################################################
 
+#############################################################################################
 def train_IOU(predict_box, label_box):
 
     box1_x1 = predict_box[..., 0:1] - predict_box[..., 2:3] / 2
@@ -137,10 +139,6 @@ def train_IOU(predict_box, label_box):
 
     return iou
 
-def save_fig(model, images, original_height, original_width):
-
-    return image
-
 def cal_loss(model, images, labels):
 
     # 모델의 최종 output은 1460 이 된다.
@@ -148,11 +146,10 @@ def cal_loss(model, images, labels):
     with tf.GradientTape() as tape:
         predict = model(images, True)   # [:, 1470]
         predict = tf.reshape(predict, [-1, FLAGS.output_size, FLAGS.output_size, 20 + 2*5]) # [:, 7, 7, 30]
-
+        a = tf.expand_dims(tf.argmax(predict[..., :20], -1), -1)
         output_b1 = train_IOU(predict[..., 21:25], labels[..., 21:25])    # [:, 7, 7, 1]
         output_b2 = train_IOU(predict[..., 26:30], labels[..., 21:25])    # [:, 7, 7, 1]
         ious = tf.concat([output_b1, output_b2], 3) # [:, 7, 7, 2]
-        # torch 에서는 max를 따로 구했는데 왜 ???굳히??
         best_box = tf.expand_dims(tf.argmax(ious, axis=3), 3)    # [:, 7, 7, 1]
         best_box = tf.cast(best_box, tf.float32)
         iou_max = tf.expand_dims(np.max(ious.numpy(), 3), 3)    # [:, 7, 7, 1]
@@ -187,14 +184,73 @@ def cal_loss(model, images, labels):
         # =================== #
         # No Object loss #
         # --> 동영상 52:03 초 부터 다시보면서 하면된다. 이해는 다 된다.
+        no_object_loss = tf.keras.losses.MeanSquaredError()(tf.reshape((1 - exists_box) * labels[..., 20:21], [-1, 7*7]),
+                                                            tf.reshape((1 - exists_box) * predict[..., 20:21], [-1, 7*7]))
+        no_object_loss += tf.keras.losses.MeanSquaredError()(tf.reshape((1 - exists_box) * labels[..., 20:21], [-1, 7*7]),
+                                                            tf.reshape((1 - exists_box) * predict[..., 25:26], [-1, 7*7]))
         # =================== #
 
-    return total_loss
+        # =================== #
+        # Class loss #
+        class_loss = tf.keras.losses.MeanSquaredError()(tf.reshape(exists_box * labels[..., :20], [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 20]),
+                                                        tf.reshape(exists_box * predict[..., :20], [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 20]))
+        # =================== #
+
+        loss = FLAGS.coord_lambda * box_loss \
+            + object_loss \
+            + FLAGS.noObject_lambda * no_object_loss \
+            + class_loss
+
+    grads = tape.gradient(loss, model.trainable_variables)
+    optim.apply_gradients(zip(grads, model.trainable_variables))
+
+    return loss
+#############################################################################################
+
+#############################################################################################
+def convert_cellboxes_box(output, S=FLAGS.output_size):
+
+    # convert to cellbox
+    predict = tf.reshape(output, [tf.shape(output)[0], 7, 7, 20 + 2*5])
+
+    box1 = predict[..., 21:25]
+    box2 = predict[..., 26:30]  # 학습할 때는 이 부분이 참이도록 학습하였음
+
+    scores = tf.concat([predict[..., 20:21], predict[..., 25:26]], 3)
+    best_box = tf.argmax(scores, 3)
+    best_boxes = box1 * (1 - best_box) + best_box * box2    # 216줄로 인해 이렇게 수식   # [:, 7, 7, 4]
+    cell_indices = np.tile(np.arange(0,7, dtype=np.float32), [tf.shape(output)[0], FLAGS.output_size, 1])    # [:, 7, 7]
+    cell_indices = np.expand_dims(cell_indices, 3)  # [:, 7, 7, 1]
+
+    x = 1 / S * (best_boxes[..., :1] + cell_indices)    # [:, 7, 7, 1]
+    y = 1 / S * (best_boxes[..., 1:2] + np.transpose(cell_indices, [0, 2, 1, 3]))   # [:, 7, 7, 1]
+    w_h = 1 / S * (best_boxes[..., 2:4])    # [:, 7, 7, 2]
+
+    converted_bboxes = tf.concat([x, y, w_h], 3)    # [:, 7, 7, 4]
+    predict_class = predict[..., :20]
+    predict_class = tf.expand_dims(tf.argmax(predict_class, 3), 3) # [:, 7, 7, 1]
+    best_confidence = tf.maximum(predict[..., 25:26], predict[..., 20:21])  # [:, 7, 7, 1]
+
+    convert_box = tf.concat([predict_class, best_confidence, converted_bboxes], 3)
+
+    # cellbox to box
+    convert_box = tf.reshape(convert_box, [tf.shape(output)[0], FLAGS.output_size*FLAGS.output_size, 6])
+    convert_box[..., 0:1] = tf.cast(convert_box[..., 0:1], tf.int64)
+    all_boxes = []
+
+    for idx in range(tf.shape(output)[0]):
+        boxes = []
+
+        for box_idx in range(FLAGS.output_size*FLAGS.output_size):
+            boxes.append(x for x in convert_box[idx, box_idx, :])
+        all_boxes.append(boxes)
+
+    return all_boxes
+#############################################################################################
 
 def main():
     model = Yolo_v1((FLAGS.img_size, FLAGS.img_size, 3))
     model.summary()
-
 
     text_list = os.listdir(FLAGS.tr_txt_path)
     text_list = [FLAGS.tr_txt_path + '/' + data for data in text_list]
@@ -221,7 +277,6 @@ def main():
     it = iter(data)
     for step in range(batch_idx):
         image, label, shape, list_ = next(it)
-        #print(list_)
         original_height, original_width = shape[:, 0], shape[:, 1]
         label = read_label(label, FLAGS.batch_size)
 
@@ -229,10 +284,14 @@ def main():
 
         print(loss, count)
 
-        if count % 100 == 0:
-            img = save_fig(model, image, original_height, original_width)
-            cv2.imshow("ss", img)
-            cv2.waitKey(0)
+
+        output = model(image, False)
+        predict = convert_cellboxes_box(output)
+
+        #if count % 100 == 0:
+        #    img = save_fig(model, image, original_height, original_width)
+        #    cv2.imshow("ss", img)
+        #    cv2.waitKey(0)
 
         count += 1
 
