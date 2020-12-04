@@ -7,6 +7,7 @@ from random import random, shuffle, randint
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import os
 import sys
 import math
@@ -37,7 +38,8 @@ flags.DEFINE_float("lr", 0.00002, "Leanring rate")
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
 
-optim = tf.compat.v1.train.MomentumOptimizer(FLAGS.lr, momentum=0.9)
+#optim = tf.compat.v1.train.MomentumOptimizer(FLAGS.lr, momentum=0.9)
+optim = tf.keras.optimizers.Adam(FLAGS.lr)
 
 #############################################################################################
 def func_(image, label):
@@ -252,9 +254,9 @@ def convert_cellboxes_box(output, S=FLAGS.output_size):
 
 def nms(bboxes, iou_threshold, threshold):
 
-    for box in bboxes:
-        if box[1] > threshold:
-            print("@@@@@@@@")       # 학습이 되는지 안되는지 확인용
+    #for box in bboxes:
+    #    if box[1] > threshold:
+    #        print("@@@@@@@@")       # 학습이 되는지 안되는지 확인용
 
     bboxes = [box for box in bboxes if box[1] > threshold]
     bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
@@ -268,8 +270,8 @@ def nms(bboxes, iou_threshold, threshold):
             for box in bboxes
             if box[0] != chosen_box[0]
             or train_IOU(
-                (chosen_box[2:]),
-                (box[2:])
+                chosen_box[2:],
+                box[2:]
             )
             < iou_threshold
         ]
@@ -277,6 +279,42 @@ def nms(bboxes, iou_threshold, threshold):
         bboxes_after_nms.append(chosen_box)
 
     return bboxes_after_nms
+#############################################################################################
+
+#############################################################################################
+def gener_sample(image, boxes):
+    
+    """Plots predicted bounding boxes on the image"""
+    im = np.array(image)
+    height, width, _ = im.shape
+
+    # Create figure and axes
+    fig, ax = plt.subplots(1)
+    # Display the image
+    ax.imshow(im)
+
+    # box[0] is x midpoint, box[2] is width
+    # box[1] is y midpoint, box[3] is height
+
+    # Create a Rectangle potch
+    for box in boxes:
+        box = box[2:]
+        assert len(box) == 4, "Got more values than in x, y, w, h, in a box!"
+        upper_left_x = box[0] - box[2] / 2
+        upper_left_y = box[1] - box[3] / 2
+        rect = patches.Rectangle(
+            (upper_left_x * width, upper_left_y * height),
+            box[2] * width,
+            box[3] * height,
+            linewidth=1,
+            edgecolor="r",
+            facecolor="none",
+        )
+        # Add the patch to the Axes
+        ax.add_patch(rect)
+
+
+    plt.show()
 #############################################################################################
 
 def main():
@@ -315,20 +353,24 @@ def main():
 
         print(loss, count)
 
+        if count % 100 == 0 and count != 0:
+            output = model(image, False)
+            for idx in range(8):
+                boxes = convert_cellboxes_box(output)
+                boxes = nms(boxes[idx], 0.5, 0.2)
+                im = image[idx].numpy()
+                #im = np.transpose(im, [1,2,0])
+                gener_sample(im, boxes)
 
-        output = model(image, False)
-        predict_boxxes = convert_cellboxes_box(output)
-        all_pred_boxes = []
-        for idx in range(FLAGS.batch_size):
-            nms_boxes = nms(predict_boxxes[idx], 0.5, 0.2)
 
-            for nms_box in nms_boxes:
-                all_pred_boxes.append([count] + nms_boxes)
+        #output = model(image, False)
+        #predict_boxxes = convert_cellboxes_box(output)
+        #all_pred_boxes = []
+        #for idx in range(FLAGS.batch_size):
+        #    nms_boxes = nms(predict_boxxes[idx], 0.5, 0.2)
 
-        #if count % 100 == 0:
-        #    img = save_fig(model, image, original_height, original_width)
-        #    cv2.imshow("ss", img)
-        #    cv2.waitKey(0)
+        #    for nms_box in nms_boxes:
+        #        all_pred_boxes.append([count] + nms_boxes)
 
         count += 1
 
