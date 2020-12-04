@@ -32,7 +32,7 @@ flags.DEFINE_float("coord_lambda", 5.0, "")
 
 flags.DEFINE_float("noObject_lambda", 0.5, "")
 
-flags.DEFINE_float("lr", 0.0001, "Leanring rate")
+flags.DEFINE_float("lr", 0.00002, "Leanring rate")
 
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
@@ -217,7 +217,8 @@ def convert_cellboxes_box(output, S=FLAGS.output_size):
     box2 = predict[..., 26:30]  # 학습할 때는 이 부분이 참이도록 학습하였음
 
     scores = tf.concat([predict[..., 20:21], predict[..., 25:26]], 3)
-    best_box = tf.argmax(scores, 3)
+    best_box = tf.expand_dims(tf.argmax(scores, 3), 3)
+    best_box = tf.cast(best_box, tf.float32)
     best_boxes = box1 * (1 - best_box) + best_box * box2    # 216줄로 인해 이렇게 수식   # [:, 7, 7, 4]
     cell_indices = np.tile(np.arange(0,7, dtype=np.float32), [tf.shape(output)[0], FLAGS.output_size, 1])    # [:, 7, 7]
     cell_indices = np.expand_dims(cell_indices, 3)  # [:, 7, 7, 1]
@@ -229,23 +230,53 @@ def convert_cellboxes_box(output, S=FLAGS.output_size):
     converted_bboxes = tf.concat([x, y, w_h], 3)    # [:, 7, 7, 4]
     predict_class = predict[..., :20]
     predict_class = tf.expand_dims(tf.argmax(predict_class, 3), 3) # [:, 7, 7, 1]
+    predict_class = tf.cast(predict_class, tf.float32)
     best_confidence = tf.maximum(predict[..., 25:26], predict[..., 20:21])  # [:, 7, 7, 1]
 
     convert_box = tf.concat([predict_class, best_confidence, converted_bboxes], 3)
 
     # cellbox to box
     convert_box = tf.reshape(convert_box, [tf.shape(output)[0], FLAGS.output_size*FLAGS.output_size, 6])
-    convert_box[..., 0:1] = tf.cast(convert_box[..., 0:1], tf.int64)
+    convert_box = convert_box.numpy()
+    convert_box[..., 0] = tf.cast(convert_box[..., 0], tf.int64)
     all_boxes = []
 
     for idx in range(tf.shape(output)[0]):
         boxes = []
 
         for box_idx in range(FLAGS.output_size*FLAGS.output_size):
-            boxes.append(x for x in convert_box[idx, box_idx, :])
+            boxes.append([x for x in convert_box[idx, box_idx, :]])
         all_boxes.append(boxes)
 
     return all_boxes
+
+def nms(bboxes, iou_threshold, threshold):
+
+    for box in bboxes:
+        if box[1] > threshold:
+            print("@@@@@@@@")       # 학습이 되는지 안되는지 확인용
+
+    bboxes = [box for box in bboxes if box[1] > threshold]
+    bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
+    bboxes_after_nms = []
+
+    while bboxes:
+        chosen_box = bboxes.pop(0)
+
+        bboxes = [
+            box
+            for box in bboxes
+            if box[0] != chosen_box[0]
+            or train_IOU(
+                (chosen_box[2:]),
+                (box[2:])
+            )
+            < iou_threshold
+        ]
+
+        bboxes_after_nms.append(chosen_box)
+
+    return bboxes_after_nms
 #############################################################################################
 
 def main():
@@ -286,7 +317,13 @@ def main():
 
 
         output = model(image, False)
-        predict = convert_cellboxes_box(output)
+        predict_boxxes = convert_cellboxes_box(output)
+        all_pred_boxes = []
+        for idx in range(FLAGS.batch_size):
+            nms_boxes = nms(predict_boxxes[idx], 0.5, 0.2)
+
+            for nms_box in nms_boxes:
+                all_pred_boxes.append([count] + nms_boxes)
 
         #if count % 100 == 0:
         #    img = save_fig(model, image, original_height, original_width)
