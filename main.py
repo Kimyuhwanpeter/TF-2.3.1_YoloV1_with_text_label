@@ -79,6 +79,12 @@ def read_label(file, batch_size):
             classes = int(line.split(',')[6])
 
             # xmin, xmax에 대해서는 이게 순서가 뒤죽박죽인것도 있는거같아서
+            if xmax > xmin:
+                xmax = xmax
+                xmin = xmin
+            if xmax < xmin:
+                xmax = xmin
+                xmin = xmax
             # https://github.com/ivder/LabelMeYoloConverter/blob/master/convert.py 참고
 
             x = (xmin + xmax) / 2.0
@@ -102,10 +108,10 @@ def read_label(file, batch_size):
             responsibleGridY = j
 
 
-            # 이부분 순서를 고쳐야한다! 우선은 이 인덱스 순서는 loss를 작성하고 진행하자
-            responsibleGrid[b][responsibleGridX][responsibleGridY][classes] = 1    # class
-            responsibleGrid[b][responsibleGridX][responsibleGridY][21:25] = boxData    # box
-            responsibleGrid[b][responsibleGridX][responsibleGridY][20] = 1 # confidence
+            if responsibleGrid[b][responsibleGridX, responsibleGridY, 20] == 0:
+                responsibleGrid[b][responsibleGridX][responsibleGridY][classes] = 1    # class
+                responsibleGrid[b][responsibleGridX][responsibleGridY][21:25] = boxData    # box
+                responsibleGrid[b][responsibleGridX][responsibleGridY][20] = 1 # confidence
 
 
     responsibleGrid = np.array(responsibleGrid, dtype=np.float32)
@@ -131,8 +137,11 @@ def train_IOU(predict_box, label_box):
     intersect_x2 = tf.minimum(box1_x2, box2_x2)
     intersect_y2 = tf.minimum(box1_y2, box2_y2)
 
-    intersect = tf.clip_by_value(intersect_x2 - intersect_x1, clip_value_min=0, clip_value_max=7) * \
-                tf.clip_by_value(intersect_y2 - intersect_y1, clip_value_min=0, clip_value_max=7)
+    intersect = tf.where(intersect_x2 - intersect_x1 < 0, 0, intersect_x2 - intersect_x1) * \
+                tf.where(intersect_y2 - intersect_y1 < 0, 0, intersect_y2 - intersect_y1)
+
+    #intersect = tf.clip_by_value(intersect_x2 - intersect_x1, clip_value_min=0, clip_value_max=7) * \
+    #            tf.clip_by_value(intersect_y2 - intersect_y1, clip_value_min=0, clip_value_max=7)
 
     box1_area = tf.abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
     box2_area = tf.abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
@@ -238,7 +247,7 @@ def convert_cellboxes_box(output, S=FLAGS.output_size):
     convert_box = tf.concat([predict_class, best_confidence, converted_bboxes], 3)
 
     # cellbox to box
-    convert_box = tf.reshape(convert_box, [tf.shape(output)[0], FLAGS.output_size*FLAGS.output_size, 6])
+    convert_box = tf.reshape(convert_box, [tf.shape(output)[0], FLAGS.output_size*FLAGS.output_size, -1])
     convert_box = convert_box.numpy()
     convert_box[..., 0] = tf.cast(convert_box[..., 0], tf.int64)
     all_boxes = []
@@ -269,7 +278,7 @@ def nms(bboxes, iou_threshold, threshold):
             box
             for box in bboxes
             if box[0] != chosen_box[0]
-            or train_IOU(
+            or test_IOU(
                 chosen_box[2:],
                 box[2:]
             )
@@ -279,6 +288,37 @@ def nms(bboxes, iou_threshold, threshold):
         bboxes_after_nms.append(chosen_box)
 
     return bboxes_after_nms
+
+def test_IOU(predict_box, label_box):
+
+    box1_x1 = predict_box[0] - predict_box[2] / 2
+    box1_y1 = predict_box[1] - predict_box[3] / 2
+    box1_x2 = predict_box[0] + predict_box[2] / 2
+    box1_y2 = predict_box[1] + predict_box[3] / 2
+
+    box2_x1 = label_box[0] - label_box[2] / 2
+    box2_y1 = label_box[1] - label_box[3] / 2
+    box2_x2 = label_box[0] + label_box[2] / 2
+    box2_y2 = label_box[1] + label_box[3] / 2
+
+    intersect_x1 = tf.maximum(box1_x1, box2_x1)
+    intersect_y1 = tf.maximum(box1_y1, box2_y1)
+    intersect_x2 = tf.minimum(box1_x2, box2_x2)
+    intersect_y2 = tf.minimum(box1_y2, box2_y2)
+
+    intersect = tf.where(intersect_x2 - intersect_x1 < 0, 0, intersect_x2 - intersect_x1) * \
+                tf.where(intersect_y2 - intersect_y1 < 0, 0, intersect_y2 - intersect_y1)
+
+    #intersect = tf.clip_by_value(intersect_x2 - intersect_x1, clip_value_min=0, clip_value_max=7) * \
+    #            tf.clip_by_value(intersect_y2 - intersect_y1, clip_value_min=0, clip_value_max=7)
+
+    box1_area = tf.abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
+    box2_area = tf.abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
+
+    iou = intersect / (box1_area + box2_area - intersect + 1e-7)
+
+    return iou
+
 #############################################################################################
 
 #############################################################################################
@@ -351,28 +391,18 @@ def main():
 
         loss = cal_loss(model, image, label)    # 이 부분은 쉽게 이해함
 
-        print(loss, count)
-
-        if count % 100 == 0 and count != 0:
-            output = model(image, False)
-            for idx in range(8):
-                boxes = convert_cellboxes_box(output)
-                boxes = nms(boxes[idx], 0.5, 0.2)
-                im = image[idx].numpy()
-                #im = np.transpose(im, [1,2,0])
-                gener_sample(im, boxes)
-
-
-        #output = model(image, False)
-        #predict_boxxes = convert_cellboxes_box(output)
-        #all_pred_boxes = []
-        #for idx in range(FLAGS.batch_size):
-        #    nms_boxes = nms(predict_boxxes[idx], 0.5, 0.2)
-
-        #    for nms_box in nms_boxes:
-        #        all_pred_boxes.append([count] + nms_boxes)
+        if count % 10 == 0:
+            print("Epoch: {} [{}/{}] loss = {}".format(1, step + 1, batch_idx, loss)) 
 
         count += 1
+
+    output = model(image, False)
+    for idx in range(8):
+        boxes = convert_cellboxes_box(output)
+        boxes = nms(boxes[idx], 0.5, 0.2)
+        im = image[idx].numpy()
+        #im = np.transpose(im, [1,2,0])
+        gener_sample(im, boxes)
 
 if __name__ == "__main__":
     main()
