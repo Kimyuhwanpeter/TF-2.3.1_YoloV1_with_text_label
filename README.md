@@ -8,7 +8,7 @@
 <br/>
 
 * 기억할것
-![image-20201208185458269]()
+![image-20201208185458269](https://github.com/Kimyuhwanpeter/TF-2.3.1_YoloV1_with_text_label/blob/main/important.JPG)
 <br/>
 
 * 하지만 pre-trained model이 없어서 50 에폭 정도 지난 후, 제대로된 바운딩 박스가 생긴다 (학습률이 매우 낮음)
