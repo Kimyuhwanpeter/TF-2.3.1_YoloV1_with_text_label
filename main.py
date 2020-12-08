@@ -15,7 +15,6 @@ import cv2
 
 OBJECT_NAMES = ["person", "bird", "cat", "cow", "dog", "horse", "sheep", "aeroplane", "boat", "bus",
                    "car", "motorbike", "train", "bottle", "chair", "dining", "table", "potted plane", "sofa", "tv/monitor"]
-seed = [randint(1, 1000) for i in range(3)]
 
 flags.DEFINE_string("tr_img_path", "D:/[1]DB/[3]detection_DB/PascalVoc2012/pascal_voc_2012/VOC2012/JPEGImages", "Training image path")
 
@@ -23,7 +22,9 @@ flags.DEFINE_string("tr_txt_path", "D:/[1]DB/[3]detection_DB/PascalVoc2012/pasca
 
 flags.DEFINE_integer("img_size", 448, "model input size")
 
-flags.DEFINE_integer("batch_size", 16, "batch size")
+flags.DEFINE_integer("batch_size", 8, "batch size")
+
+flags.DEFINE_integer("epochs", 50, "Total epochs")
 
 flags.DEFINE_integer("output_size", 7, "")
 
@@ -33,7 +34,16 @@ flags.DEFINE_float("coord_lambda", 5.0, "")
 
 flags.DEFINE_float("noObject_lambda", 0.5, "")
 
-flags.DEFINE_float("lr", 0.00002, "Leanring rate")
+flags.DEFINE_float("lr", 0.0002, "Leanring rate")
+
+flags.DEFINE_bool("pre_checkpoint", False, "True or False")
+
+flags.DEFINE_string("pre_checkpoint_path", "", "Saved checkpoint path")
+
+flags.DEFINE_bool("train", True, "True or False")
+
+flags.DEFINE_string("save_checkpoint", "", "Saving checkpoint path")
+
 
 FLAGS = flags.FLAGS
 FLAGS(sys.argv)
@@ -62,9 +72,11 @@ def read_label(file, batch_size):
 
     label = []
     responsibleGrid = np.zeros([FLAGS.batch_size, 7, 7, 25])
+    full_target_grid = []
     for b in range(batch_size):
         f = open(tf.compat.as_bytes(file[b].numpy()), 'r')
         cla = []
+        traget_grid = []
         while True:
             line = f.readline()
             if not line: break
@@ -79,12 +91,12 @@ def read_label(file, batch_size):
             classes = int(line.split(',')[6])
 
             # xmin, xmax에 대해서는 이게 순서가 뒤죽박죽인것도 있는거같아서
-            if xmax > xmin:
-                xmax = xmax
-                xmin = xmin
-            if xmax < xmin:
-                xmax = xmin
-                xmin = xmax
+            #if xmax > xmin:
+            #    xmax = xmax
+            #    xmin = xmin
+            #if xmax < xmin:
+            #    xmax = xmin
+            #    xmin = xmax
             # https://github.com/ivder/LabelMeYoloConverter/blob/master/convert.py 참고
 
             x = (xmin + xmax) / 2.0
@@ -113,10 +125,14 @@ def read_label(file, batch_size):
                 responsibleGrid[b][responsibleGridX][responsibleGridY][21:25] = boxData    # box
                 responsibleGrid[b][responsibleGridX][responsibleGridY][20] = 1 # confidence
 
+                traget_grid.append([classes, 1, x, y, w, h])
+
+        full_target_grid.append(traget_grid)
 
     responsibleGrid = np.array(responsibleGrid, dtype=np.float32)
+    traget_grid = np.array(traget_grid, dtype=np.float32)
 
-    return responsibleGrid
+    return responsibleGrid, full_target_grid
 #############################################################################################
 
 #############################################################################################
@@ -140,9 +156,6 @@ def train_IOU(predict_box, label_box):
     intersect = tf.where(intersect_x2 - intersect_x1 < 0, 0, intersect_x2 - intersect_x1) * \
                 tf.where(intersect_y2 - intersect_y1 < 0, 0, intersect_y2 - intersect_y1)
 
-    #intersect = tf.clip_by_value(intersect_x2 - intersect_x1, clip_value_min=0, clip_value_max=7) * \
-    #            tf.clip_by_value(intersect_y2 - intersect_y1, clip_value_min=0, clip_value_max=7)
-
     box1_area = tf.abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
     box2_area = tf.abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
 
@@ -164,7 +177,7 @@ def cal_loss(model, images, labels):
         best_box = tf.expand_dims(tf.argmax(ious, axis=3), 3)    # [:, 7, 7, 1]
         best_box = tf.cast(best_box, tf.float32)
         iou_max = tf.expand_dims(np.max(ious.numpy(), 3), 3)    # [:, 7, 7, 1]
-        exists_box = tf.expand_dims(labels[..., 20], 3) # [:, 7, 7, 1]
+        exists_box = tf.expand_dims(labels[..., 20], 3) # [:, 7, 7, 1] --> I^obj
 
         # =================== #
         # Box coordinate loss #
@@ -175,11 +188,12 @@ def cal_loss(model, images, labels):
         box_target = exists_box * labels[..., 21:25]
 
         box_prediction = box_prediction.numpy()
-        box_prediction[..., 2:4] = tf.math.sign(box_prediction[..., 2:4] * tf.sqrt(tf.abs(box_prediction[..., 2:4] + 1e-7)))    # sign 은 음수가 나오면 -1, 양수가나오면 1, 0이 나오면 0을 리턴한다
+        box_prediction[..., 2:4] = tf.math.sign(box_prediction[..., 2:4]) * tf.sqrt(tf.abs(box_prediction[..., 2:4] + 1e-7))    # sign 은 음수가 나오면 -1, 양수가나오면 1, 0이 나오면 0을 리턴한다
         
         box_target = box_target.numpy()
         box_target[..., 2:4] = tf.sqrt(box_target[..., 2:4])
 
+        # 내가 느끼기에는 loss가 잘못되어서 box가 이상하게 나오는것같다 여기를 고쳐보자
         box_loss = tf.keras.losses.MeanSquaredError()(tf.reshape(box_target, [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 4]),
                                        tf.reshape(box_prediction, [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 4]))
         # =================== #
@@ -191,7 +205,7 @@ def cal_loss(model, images, labels):
         object_loss = tf.keras.losses.MeanSquaredError()(tf.reshape(exists_box * labels[..., 20:21], [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 1]),
                                           tf.reshape(exists_box * pred_box, [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 1]))
         # =================== #
-
+        
         # =================== #
         # No Object loss #
         # --> 동영상 52:03 초 부터 다시보면서 하면된다. 이해는 다 된다.
@@ -199,18 +213,21 @@ def cal_loss(model, images, labels):
                                                             tf.reshape((1 - exists_box) * predict[..., 20:21], [-1, 7*7]))
         no_object_loss += tf.keras.losses.MeanSquaredError()(tf.reshape((1 - exists_box) * labels[..., 20:21], [-1, 7*7]),
                                                             tf.reshape((1 - exists_box) * predict[..., 25:26], [-1, 7*7]))
+
         # =================== #
 
         # =================== #
         # Class loss #
         class_loss = tf.keras.losses.MeanSquaredError()(tf.reshape(exists_box * labels[..., :20], [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 20]),
                                                         tf.reshape(exists_box * predict[..., :20], [FLAGS.batch_size*FLAGS.output_size*FLAGS.output_size, 20]))
+
         # =================== #
 
         loss = FLAGS.coord_lambda * box_loss \
             + object_loss \
             + FLAGS.noObject_lambda * no_object_loss \
             + class_loss
+        
 
     grads = tape.gradient(loss, model.trainable_variables)
     optim.apply_gradients(zip(grads, model.trainable_variables))
@@ -253,6 +270,23 @@ def convert_cellboxes_box(output, S=FLAGS.output_size):
     all_boxes = []
 
     for idx in range(tf.shape(output)[0]):
+        boxes = []
+
+        for box_idx in range(FLAGS.output_size*FLAGS.output_size):
+            boxes.append([x for x in convert_box[idx, box_idx, :]])
+        all_boxes.append(boxes)
+
+    return all_boxes
+
+def convert_label_box(label, S=FLAGS.output_size):
+
+    # cellbox to box
+    convert_box = tf.reshape(label, [tf.shape(label)[0], FLAGS.output_size*FLAGS.output_size, -1])
+    convert_box = convert_box.numpy()
+    convert_box[..., 0] = tf.cast(convert_box[..., 0], tf.int64)
+    all_boxes = []
+
+    for idx in range(tf.shape(label)[0]):
         boxes = []
 
         for box_idx in range(FLAGS.output_size*FLAGS.output_size):
@@ -342,6 +376,8 @@ def gener_sample(image, boxes):
         assert len(box) == 4, "Got more values than in x, y, w, h, in a box!"
         upper_left_x = box[0] - box[2] / 2
         upper_left_y = box[1] - box[3] / 2
+        print(box[2] * width)
+        print(box[3] * height)
         rect = patches.Rectangle(
             (upper_left_x * width, upper_left_y * height),
             box[2] * width,
@@ -361,48 +397,73 @@ def main():
     model = Yolo_v1((FLAGS.img_size, FLAGS.img_size, 3))
     model.summary()
 
-    text_list = os.listdir(FLAGS.tr_txt_path)
-    text_list = [FLAGS.tr_txt_path + '/' + data for data in text_list]
+    if FLAGS.pre_checkpoint:
+        ckpt = tf.train.Checkpoint(model=model, optim=optim)
+        ckpt_manager = tf.train.CheckpointManager(ckpt, FLAGS.pre_checkpoint_path, 5)
+        if ckpt_manager.latest_checkpoint:
+            ckpt.restore(ckpt_manager.latest_checkpoint)
+            print("Restored the checkpoint!!")
 
-    image_list = os.listdir(FLAGS.tr_img_path)
-    image_list = [FLAGS.tr_img_path + '/' + data for data in image_list]
+    if FLAGS.train:
+        text_list = os.listdir(FLAGS.tr_txt_path)
+        text_list = [FLAGS.tr_txt_path + '/' + data for data in text_list]
+
+        image_list = os.listdir(FLAGS.tr_img_path)
+        image_list = [FLAGS.tr_img_path + '/' + data for data in image_list]
 
 
-    count = 0
-    A = list(zip(image_list, text_list))
-    shuffle(A)
-    image_list, text_list = zip(*A)
+        count = 0
+        A = list(zip(image_list, text_list))
+        shuffle(A)
+        image_list, text_list = zip(*A)
 
-    image_list = np.array(image_list)
-    text_list = np.array(text_list)
+        image_list = np.array(image_list)
+        text_list = np.array(text_list)
 
-    data = tf.data.Dataset.from_tensor_slices((image_list, text_list))
-    data = data.shuffle(len(text_list))
-    data = data.map(func_, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-    data = data.batch(FLAGS.batch_size)
-    data = data.prefetch(tf.data.experimental.AUTOTUNE)
+        for epoch in range(FLAGS.epochs):
 
-    batch_idx = len(text_list) // FLAGS.batch_size
-    it = iter(data)
-    for step in range(batch_idx):
-        image, label, shape, list_ = next(it)
-        original_height, original_width = shape[:, 0], shape[:, 1]
-        label = read_label(label, FLAGS.batch_size)
+            data = tf.data.Dataset.from_tensor_slices((image_list, text_list))
+            data = data.shuffle(len(text_list))
+            data = data.map(func_)
+            data = data.batch(FLAGS.batch_size)
+            data = data.prefetch(tf.data.experimental.AUTOTUNE)
 
-        loss = cal_loss(model, image, label)    # 이 부분은 쉽게 이해함
+            batch_idx = len(text_list) // FLAGS.batch_size
+            it = iter(data)
+            for step in range(batch_idx):
+                image, label, shape, list_ = next(it)
+                original_height, original_width = shape[:, 0], shape[:, 1]
+                tr_label, target_label = read_label(label, FLAGS.batch_size)
 
-        if count % 10 == 0:
-            print("Epoch: {} [{}/{}] loss = {}".format(1, step + 1, batch_idx, loss)) 
+                loss = cal_loss(model, image, tr_label)
 
-        count += 1
+                if count % 10 == 0:
+                    print("Epoch: {} [{}/{}] loss = {}".format(epoch, step + 1, batch_idx, loss))
 
-    output = model(image, False)
-    for idx in range(8):
-        boxes = convert_cellboxes_box(output)
-        boxes = nms(boxes[idx], 0.5, 0.2)
-        im = image[idx].numpy()
-        #im = np.transpose(im, [1,2,0])
-        gener_sample(im, boxes)
+                if count % 1000 == 0:
+                    if count != 0:
+                        output = model(image, False)
+                        for idx in range(2):
+                            boxes = convert_cellboxes_box(output)
+                            boxes = nms(boxes[idx], 0.5, 0.2)
+
+                            im = image[idx].numpy()
+                            gener_sample(im, boxes)
+                            gener_sample(im, target_label[idx])
+
+                if count % 1500 == 0:
+                    num_ = int(count // 1500)
+                    model_dir = "%s/%s" % (FLAGS.save_checkpoint, num_)
+
+                    if not os.path.isdir(model_dir):
+                        os.makedirs(model_dir)
+                        print("Make {} files to save checkpoint".format(num_))
+                    ckpt = tf.train.Checkpoint(model=model, optim=optim)
+                    ckpt_dir = model_dir + "/" + "Yolo_v1_{}.ckpt".format(count)
+
+                    ckpt.save(ckpt_dir)
+
+                count += 1
 
 if __name__ == "__main__":
-    main()
+     main()
